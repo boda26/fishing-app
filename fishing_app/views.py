@@ -4,23 +4,26 @@ import math
 import time
 from datetime import datetime
 import random
+
+import pika
 import requests
 
 from django.conf import settings
+import redis
 from django.db import transaction
 from django.db.models import Sum, F
-from django.shortcuts import render
 
 # Create your views here.
 
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import serializers
+from rest_framework import serializers, status
 
-from .models import User, UserInventory, Fish, FishCatched
+from .models import User, UserInventory, Fish, FishCatched, ShopItem, ShoppedItem
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from decimal import Decimal
+from .tasks import send_purchase_confirmation_email
 
 class FishCatchedSerializer(serializers.ModelSerializer):
     fish_type_name = serializers.CharField(source='fish_type.type')
@@ -70,12 +73,68 @@ class ChatGeneralView(APIView):
 class ChatCommandView(APIView):
     @csrf_exempt
     def post(self, request):
-        pass
+        api_key = settings.OPENAI_API_KEY
+        message = request.data.get('message')
+        key_words = ['fish', 'play', 'sell']
+        key_words_str = ",".join(key_words)
+        prompt = f'Given the keywords [{key_words_str}], please match them to the message: "{message}" and return the matched keywords. And return the closest matched keyword. Cannot return none. Just return the keyword without any description!'
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+        data = {
+            'model': 'gpt-3.5-turbo',
+            'messages': [
+                {'role': 'user', 'content': prompt}
+            ]
+        }
+        response = requests.post('https://api.openai.com/v1/chat/completions', headers=headers, json=data)
+        if response.status_code == 200:
+            result = response.json()
+            filtered_result = result['choices'][0]['message']['content'] if result.get('choices') else 'No content'
+            return Response({"message": filtered_result}, status=200)
+        else:
+            return Response(
+                {"message": "Failed to get a response from OpenAI"},
+                status=response.status_code
+            )
 
 class ChatDrawView(APIView):
     @csrf_exempt
     def post(self, request):
-        pass
+        try:
+            api_key = settings.OPENAI_API_KEY  # 从 settings 文件中获取 OpenAI API 密钥
+
+            prompt = request.data.get('prompt')
+
+            # 检查 prompt 是否存在
+            if not prompt:
+                return Response({'error': 'Prompt is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 根据样例构建详细的 prompt
+            detailed_prompt = f"Given the keywords [{prompt}], draw an image that relates to the keywords - requirements: Note: the image created should be more realistic, rather than in cartoon style."
+
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json',
+            }
+            data = {
+                'prompt': detailed_prompt,
+                'n': 1,
+                'size': '1024x1024'
+            }
+
+            response = requests.post('https://api.openai.com/v1/images/generations', headers=headers, json=data)
+
+            if response.status_code == 200:
+                result = response.json()
+                image_url = result.get('data', [])[0].get('url', 'No content')
+                return Response({'image_url': image_url}, status=status.HTTP_200_OK)
+            else:
+                return Response({'error': 'Failed to generate image'}, status=response.status_code)
+
+        except requests.exceptions.RequestException as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # User views
@@ -115,8 +174,8 @@ class CreateUserView(APIView):
         User.objects.create(
             user_id=user_id,
             user_name=user_name,
-            coins=0,
-            diamonds=0,
+            coins=1000.00,
+            diamonds=100.00,
             level=1,
             current_experience=0,
             experience_for_next_level=1,
@@ -364,14 +423,163 @@ class FishCreateView(APIView):
         else:
             return Response({"errors": serializer.errors}, status=400)
 
+
+class ShopListView(APIView):
+    @csrf_exempt
 # Shop views
-def shop_list(request):
-    return JsonResponse({"message": "Shop item list"})
+    def get(self, request):
+        items = list(ShopItem.objects.all().values())
 
+        return JsonResponse({
+            'code': 200,
+            'data': items
+        })
 
-@csrf_exempt
-def shop_purchase(request):
-    return JsonResponse({"message": "Item purchased"})
+class AddShopItemView(APIView):
+    @csrf_exempt
+    def post(self, request):
+        name = request.data.get('name')
+        category = request.data.get('category')
+        coins = request.data.get('coins')
+        diamonds = request.data.get('diamonds')
+
+        # check for duplicate
+        exist_item = ShopItem.objects.filter(name=name)
+        if exist_item:
+            return JsonResponse({'code': 400, 'message': 'Item already exists'}, status=400)
+
+        ShopItem.objects.create(
+            name=name, category=category, coins=coins, diamonds=diamonds
+        )
+        return JsonResponse({
+            'code': 200,
+            'message': f'Successfully created shop item {name}'
+        })
+
+class DeleteShopItemView(APIView):
+    @csrf_exempt
+    def delete(self, request):
+        name = request.data.get('name')
+        ShopItem.objects.filter(name=name).delete()
+        return JsonResponse({
+            'code': 200,
+            'message': f'Successfully deleted shop item {name}'
+        })
+
+redis_instance = redis.Redis(host='localhost', port=6379, db=0)
+connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+channel = connection.channel()
+
+channel.queue_declare(queue='shop_purchase_queue')
+
+class ShopPurchaseView(APIView):
+
+    def determine_currency(self, category):
+        diamond_categories = ['Time Acceleration Card', 'Food']
+        return 'diamonds' if category in diamond_categories else 'coins'
+
+    @csrf_exempt
+    def post(self, request):
+        user_id = request.data.get('user_id')
+        item_name = request.data.get('item_name')
+        category = request.data.get('category')
+
+        lock_key = f"shop_items_lock_{user_id}_{item_name}"
+        lock = redis_instance.set(lock_key, 1, nx=True, ex=10)  # 锁定10秒，避免并发操作
+
+        if not lock:
+            return Response({"message": "Too many requests! Try again later!"}, status=429)
+
+        try:
+            user = User.objects.filter(user_id=user_id).first()
+            if not user:
+                return Response({"message": "User not found"}, status=404)
+
+            item = ShopItem.objects.filter(category=category, name=item_name).first()
+            if not item:
+                return Response({"message": "Item not found"}, status=404)
+
+            currency = self.determine_currency(category)
+            price = getattr(item, currency)
+
+            if getattr(user, currency) < price:
+                return Response({"message": f"User does not have enough {currency}"}, status=400)
+
+            setattr(user, currency, getattr(user, currency) - price)
+            user.save()
+
+            shopped_item, created = ShoppedItem.objects.get_or_create(
+                user_id=user_id,
+                product_type=category,
+                product_name=item_name,
+                defaults={'quantity': 1}
+            )
+
+            if not created:
+                shopped_item.quantity += 1
+                shopped_item.save()
+
+            purchase_info = {
+                'user_id': user_id,
+                'item_name': item_name,
+                'category': category,
+                'price': price
+            }
+            channel.basic_publish(
+                exchange='',
+                routing_key='shop_purchase_queue',
+                body=json.dumps(purchase_info)
+            )
+            send_purchase_confirmation_email.delay(user_id, item_name, category)
+
+            return Response({"message": "Successfully purchased item!"})
+
+        finally:
+            redis_instance.delete(lock_key)
+
+        # user = User.objects.filter(user_id=user_id).first()
+        # if not user:
+        #     return Response({"message": "User not found"}, status=404)
+        #
+        # item = ShopItem.objects.filter(category=category, name=item_name).first()
+        # if not item:
+        #     return Response({"message": "Item not found"}, status=404)
+        #
+        # currency = self.determine_currency(category)
+        # price = getattr(item, currency)
+        #
+        # if getattr(user, currency) < price:
+        #     return Response({"message": f"User does not have enough {currency}"}, status=400)
+        #
+        # setattr(user, currency, getattr(user, currency) - price)
+        # user.save()
+        #
+        # shopped_item, created = ShoppedItem.objects.get_or_create(
+        #     user_id=user_id,
+        #     product_type=category,
+        #     product_name=item_name,
+        #     defaults={'quantity': 1}
+        # )
+        #
+        # if not created:
+        #     shopped_item.quantity += 1
+        #     shopped_item.save()
+        #
+        # return Response({"message": "Successfully purchased item!"})
+
+class UserShoppedItemView(APIView):
+    @csrf_exempt
+    def get(self, request):
+        user_id = request.data.get('user_id')
+        user = User.objects.filter(user_id=user_id).first()
+        print(user)
+        if not user:
+            return Response({"message": "User not found"}, status=404)
+        items = list(ShoppedItem.objects.filter(user_id=user_id).all().values())
+        return JsonResponse({
+            'code': 200,
+            'data': items
+        })
 
 
 @csrf_exempt

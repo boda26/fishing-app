@@ -133,4 +133,21 @@ REST_FRAMEWORK = {
     }
 }
 
-OPENAI_API_KEY = 'mykey'
+OPENAI_API_KEY = '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'
+
+# Redis 作为消息代理
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+
+# 配置邮件服务
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'boda010626@gmail.com'
+EMAIL_HOST_PASSWORD = 'your-email-password'
+DEFAULT_FROM_EMAIL = 'boda010626@gmail.com'
+
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+

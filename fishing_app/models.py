@@ -46,4 +46,24 @@ class UserInventory(models.Model):
     fish_catched = models.ManyToManyField(FishCatched)
     total_value = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
 
+class ShopItem(models.Model):
+    name = models.CharField(max_length=255)  # 商品名称
+    category = models.CharField(max_length=255)  # 商品类别
+    coins = models.DecimalField(max_digits=10, decimal_places=2, default=0)  # 以硬币计价
+    diamonds = models.DecimalField(max_digits=10, decimal_places=2, default=0)  # 以钻石计价
+
+    def __str__(self):
+        return self.name
+
+class ShoppedItem(models.Model):
+    user_id = models.IntegerField()  # 用户ID
+    product_name = models.CharField(max_length=255)  # 商品名称
+    product_type = models.CharField(max_length=255)  # 商品类别
+    quantity = models.IntegerField(default=1)  # 用户购买的商品数量
+    purchase_date = models.DateTimeField(auto_now_add=True)  # 购买日期
+
+    def __str__(self):
+        return f"{self.user_id} - {self.product_name}"
+
+
 
