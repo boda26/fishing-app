@@ -133,10 +133,6 @@ REST_FRAMEWORK = {
     }
 }
 
-# OPENAI_API_KEY = ''
-
-# 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
-
 # Redis 作为消息代理
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
